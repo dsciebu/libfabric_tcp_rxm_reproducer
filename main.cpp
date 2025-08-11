@@ -46,6 +46,7 @@ fi_info *makeHints(bool useRXM) {
 
   hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
   hints->ep_attr->type = FI_EP_RDM;
+  // hints->ep_attr->type = FI_EP_MSG;
   if (useRXM)
     hints->ep_attr->protocol = FI_PROTO_RXM;
   // hints->ep_attr->protocol = FI_PROTO_UNSPEC;
@@ -241,11 +242,16 @@ int main(int argc, char *argv[]) {
 
   const auto serverBufferSize = bufferSize * clientsCnt;
   auto serverBuffer = aligned_alloc(16, serverBufferSize);
+  auto sendBuffer = aligned_alloc(16, bufferSize);
+  std::memset(sendBuffer, 1, bufferSize);
 
   std::size_t PP_MR_KEY = 0xC0DE;
   fid_mr *mr = nullptr;
+  fid_mr *mrSend = nullptr;
   const auto flags = FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE;
   fi_mr_reg(domain, serverBuffer, serverBufferSize, flags, 0, PP_MR_KEY, 0, &(mr),
+            nullptr);
+  fi_mr_reg(domain, sendBuffer, bufferSize, flags, 0, PP_MR_KEY+1, 0, &(mrSend),
             nullptr);
 
   const auto localAddr = getAddr(&ep->fid);
@@ -274,19 +280,41 @@ int main(int argc, char *argv[]) {
         // printf("SERVER fi_recv\n");
         // Each client 'writes' to its one cell in the server buffer
         const auto tag = c;
-        while (fi_trecv(ep, static_cast<int *>(serverBuffer) + c, bufferSize,
-                        fi_mr_desc(mr), remoteFiAddr[c], tag, 0ULL, nullptr)) {
+        while (fi_send(ep, sendBuffer, bufferSize, fi_mr_desc(mrSend),
+                       remoteFiAddr[c], // tag, 0ULL,
+                       nullptr)) {
+        };
+        while (fi_recv(ep, static_cast<int *>(serverBuffer) + c, bufferSize,
+                        fi_mr_desc(mr), remoteFiAddr[c], //tag, 0ULL,
+                        nullptr)) {
         };
 
         // auto ret = fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr);
         // printf("SERVER fi_cq_readfrom from #%ld\n", c);
         fi_cq_err_entry comp{};
         while (1) {
+          const auto ret = fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr);
+          if (ret == 1)
+            break;
+          if (ret == -FI_EAGAIN || ret == -FI_EINTR)
+            // printf("SERVER FI_EAGAIN fi_cq_readerr from #%ld\n", c);
+            continue;
+          if (ret == -FI_EAVAIL) {
+            // printf("SERVER FI_EAVAIL fi_cq_readerr from #%ld\n", c);
+            fi_cq_readerr(rxCq, &comp, 0);
+            continue;
+          }
+          [[unlikely]] if (ret < 0) {
+            printf("SERVER Error in rea from #%ld\n", c);
+            throw std::runtime_error("Cq wait unexpected error");
+          }
+        };
+        while (1) {
           const auto ret = fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr);
           if (ret == 1)
             break;
           if (ret == -FI_EAGAIN || ret == -FI_EINTR)
-            // printf("SERVER FI_EAGAIN fi_cq_readerr from #%ld\n", i);
+            // printf("SERVER FI_EAGAIN fi_cq_readerr from #%ld\n", c);
             continue;
           if (ret == -FI_EAVAIL) {
             // printf("SERVER FI_EAVAIL fi_cq_readerr from #%ld\n", c);
@@ -316,6 +344,7 @@ int main(int argc, char *argv[]) {
     sleep(5);
 
     fi_close(&mr->fid);
+    fi_close(&mrSend->fid);
     free(serverBuffer);
     fi_close(&ep->fid);
     fi_close(&av->fid);
@@ -357,12 +386,16 @@ int main(int argc, char *argv[]) {
     CHECK(fi_enable(ep));
 
     auto clientBuffer = aligned_alloc(16, bufferSize);
+    auto recvBuffer = aligned_alloc(16, bufferSize);
     std::size_t PP_MR_KEY = 0xC0DE;
     fid_mr *mr = nullptr;
+    fid_mr *mrRecv = nullptr;
     auto flags = FI_SEND | FI_RECV;
     CHECK(fi_mr_reg(domain, clientBuffer, bufferSize, flags, 0, PP_MR_KEY, 0, &(mr),
                     nullptr));
     const auto localAddr = getAddr(&ep->fid);
+    CHECK(fi_mr_reg(domain, recvBuffer, bufferSize, flags, 0, PP_MR_KEY+1, 0,
+                    &(mrRecv), nullptr));
 
     clientAddr[rank] = localAddr;
     clientSendAddress(rank, clientAddr[rank]);
@@ -384,12 +417,19 @@ int main(int argc, char *argv[]) {
       *static_cast<int *>(clientBuffer) = rank + it;
 
       // printf("CLIENT #%d fi_send\n", rank);
-      while (fi_tsend(ep, clientBuffer, bufferSize, fi_mr_desc(mr), remoteFiAddr, tag,
+      while (fi_send(ep, clientBuffer, bufferSize, fi_mr_desc(mr), remoteFiAddr, //tag,
+      nullptr) != 0) {
+      };
+      while (fi_recv(ep, recvBuffer, bufferSize, fi_mr_desc(mrRecv), remoteFiAddr, //tag,
                       nullptr) != 0) {
       };
+
       fi_cq_err_entry comp{};
 
       while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0) {
+        // printf("CLIENT #%d fi_cq_readfrom\n", rank);
+      };
+      while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0) {
         // printf("CLIENT #%d fi_cq_readfrom\n", rank);
       };
       // printf("CLIENT #%d comp.flags=%lld comp.src_addr=%ld\n", rank,
@@ -400,6 +440,7 @@ int main(int argc, char *argv[]) {
     sleep(5);
 
     fi_close(&mr->fid);
+    fi_close(&mrRecv->fid);
     free(clientBuffer);
     fi_close(&ep->fid);
     fi_close(&av->fid);
